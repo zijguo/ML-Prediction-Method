@@ -21,9 +21,8 @@ rf.fit <- random.forest(Y,X4,
                         num.trees = num.trees,
                         mtry = mtry,
                         max.depth = max.depth,
-                        min.node.size = min.node.size
-                        )
-# MSE with full data
+                        min.node.size = min.node.size)
+# MSE with full data, use Y[rf.fit$A1.ind] if data.split=TRUE
 mean((rf.fit$predicted.values-Y)^2)
 # MSE using CV
 rf.fit$MSE.oob
@@ -44,9 +43,8 @@ xgb.fit <- XGBoost(Y,X4,
                    max_depth = max_depth,
                    min_child_weight = min_child_weight,
                    subsample = subsample,
-                   colsample_bytree = colsample_bytree
-                   )
-# MSE with full data
+                   colsample_bytree = colsample_bytree)
+# MSE with full data, use Y[rf.fit$A1.ind] if data.split=TRUE
 mean((xgb.fit$predicted.values-Y)^2)
 # MSE using CV
 xgb.fit$MSE.cv
