@@ -2,6 +2,7 @@
 ### random forest, xgboost and sparse additive model.
 
 
+library(Matrix)
 library(ranger)
 library(xgboost)
 library(SAM)
@@ -19,16 +20,22 @@ library(SAM)
 ###        max.depth: Maximal depth of each tree, with default value 0 referring to unlimited depth
 ###        min.node.size: Minimal size of each leaf node
 ###        MSE.thol: A large value used for the start of hyper-parameter selection, default by 1e12
-### Output: predicted.values: Predictions of the outcome Y
-###         forest.model: Random forest model object
+### Output: forest.model: Random forest model object
 ###         params: Best hyper-parameters selected by minimizing out-of-bag error
+###         predicted.values: Or predicted.A1 for data splitting, refers to predictions for the outcome
+###         nodes: n(n.A1) by num.trees matrix, rows refer to different samples, columns refer to
+###                different trees, the entrees are leaf node indices of each sample in each tree
 ###         A1.ind: Indices of data in subsample A1, available when data.split=TRUE
-###         A2.ind: Indices of data in subsample A2, available when data.split=TRUE
 ###         MSE.oob: Minimal out-of-bag error using the best hyper-parameters
-random.forest <- function(Y,X,data.split=FALSE,split.prop=0.5,num.trees=500,mtry=NULL,max.depth=0,min.node.size=5,MSE.thol=1e12) {
+random.forest <- function(Y,X,data.split=FALSE,split.prop=0.5,num.trees=NULL,mtry=NULL,max.depth=NULL,min.node.size=NULL,MSE.thol=1e12) {
   X <- as.matrix(X); Y <- as.matrix(Y)
   n <- NROW(X); p <- NCOL(X)
-  if (is.null(mtry)) mtry <- round(p/3)
+  
+  # default hyper-parameters
+  if (is.null(num.trees)) num.trees <- 200
+  if (is.null(mtry)) mtry <- seq(round(p/3),round(2*p/3),by=1)
+  if (is.null(max.depth)) max.depth <- c(0,2,4,6)
+  if(is.null(min.node.size)) min.node.size <- c(5,10,20)
   
   Data <- data.frame(cbind(Y, X))
   names(Data) <- c("Y", paste("X", 1:p, sep = ""))
@@ -73,22 +80,55 @@ random.forest <- function(Y,X,data.split=FALSE,split.prop=0.5,num.trees=500,mtry
       MSE.oob <- temp.forest$prediction.error
     }
   }
+  
   # predictions
   predicted.values <- predict(forest, data = Data.test, type = "response")$predictions
+  # nodes
+  nodes <- predict(forest, data = Data.test, type = "terminalNodes")$predictions
+  
   if (data.split) {
-    returnList <- list(predicted.values = predicted.values,
-                       forest.model = forest,
+    returnList <- list(forest.model = forest,
                        params = params,
+                       predicted.A1 = predicted.values,
+                       nodes = nodes,
                        A1.ind = A1.ind,
-                       A2.ind = A2.ind,
                        MSE.oob = MSE.oob)
   } else {
-    returnList <- list(predicted.values = predicted.values,
-                       forest.model = forest,
+    returnList <- list(forest.model = forest,
                        params = params,
-                       MSE.oob = MSE.oob)
+                       predicted.values = predicted.values,
+                       nodes = nodes,
+                       MSE.oob = MSE.oob,
+                       Data = Data)
   }
   returnList
+}
+
+
+### RF.weight
+### Function: Compute the weight matrix of Random Forest
+### Input: nodes: A n by num.trees matrix, rows refer to different samples, columns refer to
+###               different trees, the entrees are leaf node indices of each sample in each tree
+### Output: out.weight: A n by n symmetric sparse weight matrix(class dgCMatrix), the ith row represents
+###                the weights of outcome of each sample on the prediction of the ith outcome
+RF.weight <- function(nodes) {
+  n.A1 <- NROW(nodes); num.trees <- NCOL(nodes)
+  out.weight <- matrix(0,n.A1,n.A1)
+  for (j in 1:num.trees) {
+    weight.mat <- matrix(0,n.A1,n.A1) # weight matrix for single tree
+    unique.nodes <- unique(nodes[,j])
+    for (i in 1:length(unique.nodes)) {
+      ind <- nodes[,j]==unique.nodes[i] # indices of samples in the node
+      num.samples <- sum(ind) # number of samples in the node
+      w <- 1/(num.samples-1)  # weight, to remove self-prediction
+      weight.vec <- ifelse(ind,yes=w,no=0)
+      weight.mat[ind,] <- matrix(rep(weight.vec,num.samples),num.samples,byrow=T)/num.trees
+    }
+    diag(weight.mat) <- 0 # remove self prediction
+    out.weight <- out.weight + weight.mat
+  }
+  out.weight <- Matrix(out.weight, sparse = T) # sparse matrix to save memory
+  return(out.weight)
 }
 
 
@@ -98,24 +138,31 @@ random.forest <- function(Y,X,data.split=FALSE,split.prop=0.5,num.trees=500,mtry
 ### Input: Y: n by 1 outcome vector
 ###        X: n by p_x covariate matrix
 ###        data.split: logic, to do data splitting or not, default by FALSE
-###        split.prop: Proportion of data to be used for inference(size of subsample A1), default by 0.5
+###        split.prop: Proportion of data to be used for inference(size of subsample A1)
 ###        kfold: Number of folds for cross validation
-###        nrounds: Number of rounds/trees, default by 1000
-###        eta: Learning rate, default by 0.3
-###        max_depth: Maximal depth of the tree, default by 6
-###        min_child_weight: Minimum sum of sample weight (hessian) needed in a child, default by 1
-###        subsample: Subsample ratio of the training samples, default by 1
-###        colsample_bytree: Ratio of variables when constructing each tree, default by 1
-### Output: predicted.values: Predictions of the outcome Y
-###         xgb.model: XGBoost model object
+###        nrounds: Number of rounds/trees
+###        eta: Learning rate
+###        max_depth: Maximal depth of the tree
+###        min_child_weight: Minimum sum of sample weight (hessian) needed in a child
+###        subsample: Subsample ratio of the training samples
+###        colsample_bytree: Ratio of variables when constructing each tree
+### Output: xgb.model: XGBoost model object
 ###         params: Best hyper-parameters selected by cross validation
+###         predicted.values(predicted.A1): Predictions of the outcome Y
 ###         A1.ind: Indices of data in subsample A1, available when data.split=TRUE
-###         A2.ind: Indices of data in subsample A2, available when data.split=TRUE
 ###         MSE.cv: Minimal cross-validated error using the best hyper-parameters
 XGBoost <- function(Y,X,data.split=FALSE,split.prop=0.5,kfold=5,
-                    nrounds=1000,eta=0.3,max_depth=6,min_child_weight=1,subsample=1,colsample_bytree=1) { # hyper-parameters
+                    nrounds=NULL,eta=NULL,max_depth=NULL,min_child_weight=NULL,subsample=NULL,colsample_bytree=NULL) { # hyper-parameters
   X <- as.matrix(X); Y <- as.matrix(Y)
   n <- NROW(X); p <- NCOL(X)
+  
+  # default value for hyper-parameters
+  if (is.null(nrounds)) nrounds <- 1000
+  if (is.null(eta)) eta <- c(0.05, 0.1, 0.3)
+  if (is.null(max_depth)) max_depth <- c(3, 6)
+  if (is.null(min_child_weight)) min_child_weight <- c(1 ,3, 5)
+  if (is.null(subsample)) subsample <- c(0.8, 1)
+  if (is.null(colsample_bytree)) colsample_bytree <- c(0.8, 1)
   # search grid
   params.grid <- expand.grid(
     eta = eta,
@@ -183,14 +230,15 @@ XGBoost <- function(Y,X,data.split=FALSE,split.prop=0.5,kfold=5,
   # make predictions
   predicted.values <- predict(xgb.final,newdata = Data.test)
   if (data.split) {
-    returnList <- list(predicted.values = predicted.values,
-                       xgb.model = xgb.final,
+    returnList <- list(xgb.model = xgb.final,
+                       params = best.params,
+                       predicted.A1 = predicted.values,
                        A1.ind = A1.ind,
-                       A2.ind = A2.ind,
                        MSE.cv = MSE.cv)
   } else {
-    returnList <- list(predicted.values = predicted.values,
-                       xgb.model = xgb.final,
+    returnList <- list(xgb.model = xgb.final,
+                       params = best.params,
+                       predicted.values = predicted.values,
                        MSE.cv = MSE.cv)
   }
   returnList
@@ -203,12 +251,13 @@ XGBoost <- function(Y,X,data.split=FALSE,split.prop=0.5,kfold=5,
 ###        X: n by p_x covariate matrix
 ###        high_dim: logic, fit high-dimensional model, a penalty is used if TRUE, default by TRUE
 ###        lam.seq: A sequence of penalty parameters
+###        degree: Number of basis functions
 ###        kfold: Number of folds for cross validation
 ### Output: predicted.values: Predictions of the outcome Y
 ###         sam.model: Sparse additive model object
 ###         best.lam: Best lambda that minimize the cross-validated test MSE, available if high_dim=TRUE
 ###         MSE.cv: Minimal MSE by cross validation
-SAM <- function(Y,X,high_dim = TRUE,lam.seq=NULL,kfold=5) {
+SAM <- function(Y,X,high_dim = TRUE,lam.seq=NULL,degree=NULL,kfold=5) {
   X <- as.matrix(X); Y <- as.matrix(Y)
   n <- NROW(X); p <- NCOL(X)
   # search grid for lambda
@@ -217,30 +266,46 @@ SAM <- function(Y,X,high_dim = TRUE,lam.seq=NULL,kfold=5) {
   } else {
     if (is.null(lam.seq)) lam.seq <- 0.5^seq(0, 10, l=100) # approximately from 0.001 to 1
   }
-  # cross validation for the best lambda
-  MSE.cv.seq <- rep(0,length(lam.seq))
+  if (is.null(degree)) degree = 3:6
+  # cross validation for the best lambda and degree
+  len_d <- length(degree)
+  len_lam <- length(lam.seq)
+  MSE <- matrix(0, len_d, 3)
+  colnames(MSE) <- c("degree", "lambda", "MSE")
+  
+  # cross validation
   folds <- cut(seq(1,n),breaks=kfold,labels=FALSE)
-  for (k in 1:kfold) {
-    test.ind <- which(folds == k, arr.ind = TRUE)
-    # create train and test data
-    X.test <- X[test.ind,]
-    Y.test <- Y[test.ind]
-    X.train <- X[-test.ind,]
-    Y.train <- Y[-test.ind]
-    sam.k <- samQL(X.train,Y.train,lambda = lam.seq)
-    Y.fit <- predict(sam.k, newdata = X.test)$values
-    MSE.cv.seq <- MSE.cv.seq + apply(Y.fit-Y.test,2,function(x){mean(x^2)})/kfold
+  for (i in 1:len_d) {
+    mse.lam <- rep(0, len_lam)
+    for (fold in 1:kfold) {
+      testInd <- which(folds == fold, arr.ind = TRUE)
+      # create train and test data
+      X.test <- X[testInd, ]
+      Y.test <- Y[testInd]
+      X.train <- X[-testInd, ]
+      Y.train <- Y[-testInd]
+      
+      sam.fit <- samQL(X.train, Y.train, p = degree[i], lambda = lam.seq)
+      Y.fit <- predict(sam.fit, newdata = X.test)$values
+      mse.lam <- mse.lam + apply(Y.test-Y.fit, 2, function(x) mean(x^2))/kfold
+    }
+    
+    temp.lam <- lam.seq[which.min(mse.lam)]
+    MSE[i, "degree"] <- degree[i]
+    MSE[i, "lambda"] <- temp.lam
+    MSE[i, "MSE"] <- min(mse.lam)
   }
-  best.lam <- lam.seq[which.min(MSE.cv.seq)]
-  MSE.cv <- min(MSE.cv.seq)
+  best.ind <- which.min(MSE[, "MSE"])
+  best.degree <- MSE[best.ind, "degree"]
+  best.lam <- MSE[best.ind, "lambda"]
   
   # final model
-  sam.fit <- samQL(X,Y,lambda = best.lam)
+  sam.final <- samQL(X,Y,p = best.degree,lambda = best.lam)
   predicted.values <- predict(sam.fit, newdata=X)$values
   
-  returnList <- list(predicted.values = predicted.values,
-                     sam.model = sam.fit,
-                     MSE.cv = MSE.cv)
+  returnList <- list(sam.model = sam.final,
+                     predicted.values = predicted.values,
+                     MSE.cv = min(MSE[,"MSE"]))
   if (high_dim) {
     returnList$best.lam <- best.lam
   }
